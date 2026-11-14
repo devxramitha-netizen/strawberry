@@ -33,6 +33,7 @@
 #include <QFuture>
 #include <QVariant>
 #include <QString>
+#include <QStringList>
 #include <QList>
 #include <QMap>
 #include <QHash>
@@ -94,6 +95,8 @@ class SongEditor : public QDialog {
   void PendingSongsSet();
 
  protected:
+  quint64 songs_generation() const { return songs_generation_; }
+
   // Only used by the tag editor, it's here since it's part of the song data.
   enum class UpdateCoverAction {
     None = 0,
@@ -115,6 +118,8 @@ class SongEditor : public QDialog {
     Song current_;
     // The cover is only changed by the tag editor.
     UpdateCoverAction cover_action_;
+    // The cover files outside the album cover cache directory which the user confirmed deleting, only these are deleted when saving.
+    QStringList cover_delete_confirmed_files_;
     AlbumCoverImageResult cover_result_;
     // Where the lyrics were stored before a storage type was preselected for the editor, None if they were not stored anywhere.
     Song::StorageType stored_lyrics_storage_type_;
@@ -270,7 +275,7 @@ class SongEditor : public QDialog {
   QSet<int> lyrics_rows_found_;
   // What to search for, it's the same in both lyrics tabs.
   LyricsSearchType lyrics_search_type_;
-  // Changed when other songs are set, to know whether the songs were replaced while the lyrics search dialog was open.
+  // Changed when other songs are set, to know whether the songs were replaced while a dialog was open.
   quint64 songs_generation_;
 
   // Default for new lyrics from the collection settings, read before loading the songs.

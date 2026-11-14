@@ -46,6 +46,7 @@
 #include <QMap>
 #include <QVariant>
 #include <QString>
+#include <QStringList>
 #include <QUrl>
 #include <QPixmap>
 #include <QPalette>
@@ -811,7 +812,25 @@ void TagEditor::ClearCover() {
 
 void TagEditor::DeleteCover() {
 
-  UpdateCover(UpdateCoverAction::Delete);
+  // The cover files of the songs when the tag editor was opened are deleted when saving, these can be the user's own images.
+  SongList songs;
+  const QList<int> rows = CoverUpdateRows();
+  for (const int row : rows) {
+    songs << data_.value(row).original_;
+  }
+  const quint64 asked_songs_generation = songs_generation();
+  const std::optional<QStringList> confirmed_files = album_cover_choice_controller_->ConfirmDeleteCover(songs);
+  if (!confirmed_files) return;
+
+  // The songs were replaced while the user was asked, the rows are other songs now.
+  if (songs_generation() != asked_songs_generation) return;
+
+  // A file which didn't exist when the user was asked is not deleted when it exists when saving.
+  for (const int row : rows) {
+    data_[row].cover_delete_confirmed_files_ = *confirmed_files;
+  }
+
+  UpdateCover(rows, UpdateCoverAction::Delete);
 
 }
 
@@ -823,60 +842,68 @@ void TagEditor::ShowCover() {
 
 }
 
-void TagEditor::UpdateCover(const UpdateCoverAction cover_action, const AlbumCoverImageResult &cover_result) {
+QList<int> TagEditor::CoverUpdateRows() const {
 
+  QList<int> rows;
   const QModelIndexList indexes = ui_->song_list->selectionModel()->selectedIndexes();
-  if (indexes.isEmpty()) return;
+  if (indexes.isEmpty()) return rows;
 
   QString artist = data_.value(indexes.first().row()).current_.effective_albumartist();
   QString album = data_.value(indexes.first().row()).current_.album();
 
   for (const QModelIndex &idx : indexes) {
-    data_[idx.row()].cover_action_ = cover_action;
-    data_[idx.row()].cover_result_ = cover_result;
-    if (cover_action == UpdateCoverAction::New) {
-      data_[idx.row()].current_.clear_art_manual();
-      data_[idx.row()].current_.set_art_unset(false);
-    }
-    else if (cover_action == UpdateCoverAction::Unset) {
-      data_[idx.row()].current_.set_art_unset(true);
-    }
-    else if (cover_action == UpdateCoverAction::Clear || cover_action == UpdateCoverAction::Delete) {
-      data_[idx.row()].current_.set_art_embedded(false);
-      data_[idx.row()].current_.clear_art_manual();
-      data_[idx.row()].current_.clear_art_automatic();
-      data_[idx.row()].current_.set_art_unset(false);
-    }
-    if (artist != data_[idx.row()].current_.effective_albumartist() || album != data_[idx.row()].current_.album()) {
+    rows << idx.row();
+    if (artist != data_.value(idx.row()).current_.effective_albumartist() || album != data_.value(idx.row()).current_.album()) {
       artist.clear();
       album.clear();
     }
   }
 
   // Now check if we have any other songs cached that share that artist and album (and would therefore be changed as well)
+  // The selected rows are included again, which changes nothing.
   if (!artist.isEmpty() && !album.isEmpty()) {
     for (int i = 0; i < data_.count(); ++i) {
       if (data_[i].current_.effective_albumartist() == artist && data_[i].current_.album() == album) {
-        data_[i].cover_action_ = cover_action;
-        data_[i].cover_result_ = cover_result;
-        if (cover_action == UpdateCoverAction::New) {
-          data_[i].current_.clear_art_manual();
-          data_[i].current_.set_art_unset(false);
-        }
-        else if (cover_action == UpdateCoverAction::Unset) {
-          data_[i].current_.set_art_unset(true);
-        }
-        else if (cover_action == UpdateCoverAction::Clear || cover_action == UpdateCoverAction::Delete) {
-          data_[i].current_.set_art_embedded(false);
-          data_[i].current_.clear_art_manual();
-          data_[i].current_.clear_art_automatic();
-          data_[i].current_.set_art_unset(false);
-        }
+        rows << i;
       }
     }
   }
 
-  UpdateSummaryTab(data_[indexes.first().row()].current_);
+  return rows;
+
+}
+
+void TagEditor::UpdateCover(const UpdateCoverAction cover_action, const AlbumCoverImageResult &cover_result) {
+
+  UpdateCover(CoverUpdateRows(), cover_action, cover_result);
+
+}
+
+void TagEditor::UpdateCover(const QList<int> &rows, const UpdateCoverAction cover_action, const AlbumCoverImageResult &cover_result) {
+
+  if (rows.isEmpty()) return;
+
+  for (const int row : rows) {
+    Data &ref = data_[row];
+    ref.cover_action_ = cover_action;
+    ref.cover_result_ = cover_result;
+    if (cover_action == UpdateCoverAction::New) {
+      ref.current_.clear_art_manual();
+      ref.current_.set_art_unset(false);
+    }
+    else if (cover_action == UpdateCoverAction::Unset) {
+      ref.current_.set_art_unset(true);
+    }
+    else if (cover_action == UpdateCoverAction::Clear || cover_action == UpdateCoverAction::Delete) {
+      ref.current_.set_art_embedded(false);
+      ref.current_.clear_art_manual();
+      ref.current_.clear_art_automatic();
+      ref.current_.set_art_unset(false);
+    }
+  }
+
+  // The first row is the first selected song.
+  UpdateSummaryTab(data_[rows.first()].current_);
   SelectionChanged();
 
 }
@@ -972,7 +999,7 @@ void TagEditor::Save() {
           if (!ref.original_.art_automatic().isEmpty()) {
             if (ref.original_.art_automatic_is_valid()) {
               const QString art_automatic = ref.original_.art_automatic().toLocalFile();
-              if (QFile::exists(art_automatic)) {
+              if (QFile::exists(art_automatic) && AlbumCoverChoiceController::CanDeleteCoverFile(ref.original_.source(), art_automatic, ref.cover_delete_confirmed_files_)) {
                 QFile::remove(art_automatic);
               }
             }
@@ -981,7 +1008,7 @@ void TagEditor::Save() {
           if (!ref.original_.art_manual().isEmpty()) {
             if (ref.original_.art_manual_is_valid()) {
               const QString art_manual = ref.original_.art_manual().toLocalFile();
-              if (QFile::exists(art_manual)) {
+              if (QFile::exists(art_manual) && AlbumCoverChoiceController::CanDeleteCoverFile(ref.original_.source(), art_manual, ref.cover_delete_confirmed_files_)) {
                 QFile::remove(art_manual);
               }
             }

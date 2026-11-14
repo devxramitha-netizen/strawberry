@@ -20,6 +20,7 @@
 #include "config.h"
 
 #include <memory>
+#include <functional>
 
 #include "gtest_include.h"
 
@@ -46,6 +47,8 @@
 #include <QSignalSpy>
 #include <QThread>
 #include <QTest>
+#include <QTemporaryDir>
+#include <QDialogButtonBox>
 
 #include "test_utils.h"
 
@@ -68,6 +71,8 @@
 #include "covermanager/coverproviders.h"
 #include "covermanager/albumcovermanager.h"
 #include "streaming/streamingservices.h"
+
+#include "deleteconfirmationanswer.h"
 
 using namespace Qt::Literals::StringLiterals;
 using std::make_shared;
@@ -648,6 +653,125 @@ TEST_F(AlbumCoverManagerTest, CoverFileForAlbumIsUsedForAllFilesOfTheAlbum) {
   }
 
   EXPECT_TRUE(QFile::remove(cover_url.toLocalFile()));
+
+}
+
+// Regression test: deleting the cover deleted the user's own image in the album directory without asking.
+TEST_F(AlbumCoverManagerTest, DeleteCoverAsksBeforeDeletingCoverOutsideCache) {
+
+  QTemporaryDir temp_dir;
+  ASSERT_TRUE(temp_dir.isValid());
+  const QString cover_filename = temp_dir.filePath(u"cover.jpg"_s);
+  QImage image(8, 8, QImage::Format_RGB32);
+  image.fill(Qt::red);
+  ASSERT_TRUE(image.save(cover_filename, "JPG"));
+
+  AlbumItem *album_item1 = AddAlbum();
+  AlbumItem *album_item2 = AddAlbum();
+  SetAlbum(album_item1, u"Album 1"_s, Song::FileType::FLAC, QUrl::fromLocalFile(temp_dir.filePath(u"song1.flac"_s)));
+  SetAlbum(album_item2, u"Album 2"_s, Song::FileType::FLAC, QUrl::fromLocalFile(temp_dir.filePath(u"song2.flac"_s)));
+  for (AlbumItem *album_item : {album_item1, album_item2}) {
+    album_item->setData(kRoleArtAutomatic, QUrl::fromLocalFile(cover_filename));
+  }
+  SetContextMenuItems(QList<QListWidgetItem*>() << album_item1 << album_item2);
+
+  // The albums keep the cover when canceling, the file is asked about once for both albums.
+  {
+    DeleteConfirmationAnswer answer(QDialogButtonBox::Cancel);
+    DeleteCover();
+    EXPECT_EQ(1, answer.shown());
+    EXPECT_EQ(QStringList() << cover_filename, answer.files());
+  }
+  EXPECT_TRUE(QFile::exists(cover_filename));
+  EXPECT_TRUE(ItemHasCover(album_item1));
+  EXPECT_TRUE(ItemHasCover(album_item2));
+
+  {
+    DeleteConfirmationAnswer answer(QDialogButtonBox::Yes);
+    DeleteCover();
+    EXPECT_EQ(1, answer.shown());
+  }
+  EXPECT_FALSE(QFile::exists(cover_filename));
+  EXPECT_FALSE(ItemHasCover(album_item1));
+  EXPECT_FALSE(ItemHasCover(album_item2));
+
+}
+
+// Regression test: a fetched cover could be saved while the user was asked, and then the new cover file was deleted, which the user wasn't asked about.
+// An album with a cover changed while the user was asked keeps the cover, the other albums are deleted.
+TEST_F(AlbumCoverManagerTest, DeleteCoverKeepsCoverChangedWhileAsking) {
+
+  QTemporaryDir temp_dir;
+  ASSERT_TRUE(temp_dir.isValid());
+  QImage image(8, 8, QImage::Format_RGB32);
+  image.fill(Qt::red);
+  const QString new_cover_filename = temp_dir.filePath(u"new.jpg"_s);
+  ASSERT_TRUE(image.save(new_cover_filename, "JPG"));
+
+  // Each album changes one part of the cover, the last album is not changed.
+  const QList<std::function<void(AlbumItem*)>> changes = {
+    [](AlbumItem *album_item) { album_item->setData(kRoleArtEmbedded, true); },
+    [&new_cover_filename](AlbumItem *album_item) { album_item->setData(kRoleArtAutomatic, QUrl::fromLocalFile(new_cover_filename)); },
+    [&new_cover_filename](AlbumItem *album_item) { album_item->setData(kRoleArtManual, QUrl::fromLocalFile(new_cover_filename)); },
+    [](AlbumItem *album_item) { album_item->setData(kRoleArtUnset, true); },
+  };
+  QList<AlbumItem*> album_items;
+  QStringList cover_filenames;
+  for (qsizetype i = 0; i <= changes.count(); ++i) {
+    const QString cover_filename = temp_dir.filePath(QStringLiteral("%1.jpg").arg(i));
+    ASSERT_TRUE(image.save(cover_filename, "JPG"));
+    AlbumItem *album_item = AddAlbum();
+    SetAlbum(album_item, QStringLiteral("Album %1").arg(i), Song::FileType::FLAC, QUrl::fromLocalFile(temp_dir.filePath(QStringLiteral("%1.flac").arg(i))));
+    album_item->setData(kRoleArtAutomatic, QUrl::fromLocalFile(cover_filename));
+    album_items << album_item;
+    cover_filenames << cover_filename;
+  }
+  SetContextMenuItems(QList<QListWidgetItem*>(album_items.begin(), album_items.end()));
+
+  {
+    DeleteConfirmationAnswer answer(QDialogButtonBox::Yes, [&changes, &album_items]() {
+      for (qsizetype i = 0; i < changes.count(); ++i) {
+        changes.at(i)(album_items.at(i));
+      }
+    });
+    DeleteCover();
+    EXPECT_EQ(1, answer.shown());
+    EXPECT_EQ(cover_filenames, answer.files());
+  }
+
+  EXPECT_TRUE(QFile::exists(new_cover_filename));
+  for (qsizetype i = 0; i < changes.count(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_TRUE(QFile::exists(cover_filenames.at(i)));
+    EXPECT_FALSE(album_items.at(i)->data(kRoleArtAutomatic).toUrl().isEmpty());
+  }
+  EXPECT_FALSE(QFile::exists(cover_filenames.last()));
+  EXPECT_FALSE(ItemHasCover(album_items.last()));
+
+}
+
+// Selecting another artist while the user is asked clears the albums, then nothing is deleted.
+TEST_F(AlbumCoverManagerTest, DeleteCoverDoesNothingWhenAlbumsChangedWhileAsking) {
+
+  QTemporaryDir temp_dir;
+  ASSERT_TRUE(temp_dir.isValid());
+  const QString cover_filename = temp_dir.filePath(u"cover.jpg"_s);
+  QImage image(8, 8, QImage::Format_RGB32);
+  image.fill(Qt::red);
+  ASSERT_TRUE(image.save(cover_filename, "JPG"));
+
+  AlbumItem *album_item = AddAlbum();
+  SetAlbum(album_item, u"Album"_s, Song::FileType::FLAC, QUrl::fromLocalFile(temp_dir.filePath(u"song.flac"_s)));
+  album_item->setData(kRoleArtAutomatic, QUrl::fromLocalFile(cover_filename));
+  SetContextMenuItems(QList<QListWidgetItem*>() << album_item);
+
+  {
+    DeleteConfirmationAnswer answer(QDialogButtonBox::Yes, [this]() { SetContextMenuItems(QList<QListWidgetItem*>()); });
+    DeleteCover();
+    EXPECT_EQ(1, answer.shown());
+  }
+  EXPECT_TRUE(QFile::exists(cover_filename));
+  EXPECT_TRUE(ItemHasCover(album_item));
 
 }
 

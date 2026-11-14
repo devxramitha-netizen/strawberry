@@ -40,6 +40,10 @@
 #include <QString>
 #include <QSignalSpy>
 #include <QElapsedTimer>
+#include <QImage>
+#include <QAction>
+#include <QStringList>
+#include <QDialogButtonBox>
 
 #include "includes/shared_ptr.h"
 #include "core/song.h"
@@ -62,6 +66,9 @@
 #include "songeditor/lyricseditor.h"
 #include "songeditor/lyricssearchtype.h"
 #include "songeditor/lyricstab.h"
+#include "covermanager/albumcoverchoicecontroller.h"
+
+#include "deleteconfirmationanswer.h"
 
 using namespace Qt::Literals::StringLiterals;
 using std::make_shared;
@@ -448,6 +455,239 @@ TEST_F(SongEditorTest, DeletingWhileLoadingStopsLoading) {
   EXPECT_LT(delete_msec, read_msec / 4) << "Reading the songs took " << read_msec << " ms.";
   // The pool thread can still finish its own bookkeeping after the loading finished.
   EXPECT_TRUE(QThreadPool::globalInstance()->waitForDone(10000));
+
+}
+
+// Regression test: deleting the cover deleted the user's own image in the album directory without asking.
+// The cover is deleted for the other songs of the album too, so their cover files are asked about as well.
+TEST_F(SongEditorTest, TagEditorAsksBeforeDeletingCoverOutsideCache) {
+
+  QTemporaryDir temp_dir;
+  ASSERT_TRUE(temp_dir.isValid());
+  SongList songs;
+  QStringList cover_filenames;
+  for (const QString &name : {u"a"_s, u"b"_s}) {
+    Song song = CreateSong(temp_dir, name + u".mp3"_s);
+    ASSERT_TRUE(song.IsEditable());
+    ASSERT_FALSE(song.album().isEmpty());
+    song.set_source(Song::Source::Collection);
+    const QString cover_filename = temp_dir.filePath(name + u".jpg"_s);
+    QImage image(8, 8, QImage::Format_RGB32);
+    image.fill(Qt::red);
+    ASSERT_TRUE(image.save(cover_filename, "JPG"));
+    song.set_art_manual(QUrl::fromLocalFile(cover_filename));
+    songs << song;
+    cover_filenames << cover_filename;
+  }
+
+  SharedPtr<AlbumCoverLoader> albumcover_loader = make_shared<AlbumCoverLoader>(tagreader_client_);
+
+  // The cover files are kept when canceling, and deleted when saving after confirming.
+  for (const QDialogButtonBox::StandardButton button : {QDialogButtonBox::Cancel, QDialogButtonBox::Yes}) {
+    TagEditor editor(make_shared<NetworkAccessManager>(), tagreader_client_, collection_backend_, albumcover_loader, make_shared<CurrentAlbumCoverLoader>(albumcover_loader), make_shared<CoverProviders>(), lyrics_providers_, make_shared<StreamingServices>());
+    ASSERT_TRUE(editor.SetSongs(songs));
+    ASSERT_TRUE(WaitFor([&editor]() { return editor.songs().count() == 2; }));
+
+    // Only the first song is selected.
+    // The track selection dialog of the tag fetcher has a song list with the same name.
+    QListWidget *song_list = nullptr;
+    const QList<QListWidget*> song_lists = editor.findChildren<QListWidget*>(u"song_list"_s);
+    for (QListWidget *list : song_lists) {
+      if (list->window() == &editor) song_list = list;
+    }
+    ASSERT_NE(nullptr, song_list);
+    ASSERT_EQ(2, song_list->count());
+    song_list->clearSelection();
+    song_list->item(0)->setSelected(true);
+    ASSERT_EQ(1, song_list->selectedItems().count());
+
+    AlbumCoverChoiceController *album_cover_choice_controller = editor.findChild<AlbumCoverChoiceController*>();
+    ASSERT_NE(nullptr, album_cover_choice_controller);
+    // The cover is cleared first, the files deleted when saving are the files of the songs when the editor was opened.
+    QAction *clear_cover_action = album_cover_choice_controller->clear_cover_action();
+    ASSERT_TRUE(clear_cover_action->isEnabled());
+    clear_cover_action->trigger();
+    QAction *delete_cover_action = album_cover_choice_controller->delete_cover_action();
+    ASSERT_TRUE(delete_cover_action->isEnabled());
+    {
+      DeleteConfirmationAnswer answer(button);
+      delete_cover_action->trigger();
+      EXPECT_EQ(1, answer.shown());
+      EXPECT_EQ(cover_filenames, answer.files());
+    }
+
+    QSignalSpy spy_accepted(&editor, &QDialog::accepted);
+    editor.accept();
+    ASSERT_TRUE(WaitFor([&spy_accepted]() { return spy_accepted.count() > 0; }));
+    for (const QString &cover_filename : std::as_const(cover_filenames)) {
+      EXPECT_EQ(button != QDialogButtonBox::Yes, QFile::exists(cover_filename)) << cover_filename.toStdString();
+    }
+
+    // The tag completers load their models from the collection backend in the background, wait for them before the backend is deleted.
+    QThreadPool::globalInstance()->waitForDone();
+  }
+
+}
+
+// Regression test: a cover file which didn't exist when the user was asked, and existed when saving, was deleted without asking.
+TEST_F(SongEditorTest, TagEditorKeepsCoverFileCreatedAfterAsking) {
+
+  QTemporaryDir temp_dir;
+  ASSERT_TRUE(temp_dir.isValid());
+  Song song = CreateSong(temp_dir);
+  ASSERT_TRUE(song.IsEditable());
+  song.set_source(Song::Source::Collection);
+  const QStringList cover_filenames = QStringList() << temp_dir.filePath(u"automatic.jpg"_s) << temp_dir.filePath(u"manual.jpg"_s);
+  song.set_art_automatic(QUrl::fromLocalFile(cover_filenames.value(0)));
+  song.set_art_manual(QUrl::fromLocalFile(cover_filenames.value(1)));
+
+  SharedPtr<AlbumCoverLoader> albumcover_loader = make_shared<AlbumCoverLoader>(tagreader_client_);
+  TagEditor editor(make_shared<NetworkAccessManager>(), tagreader_client_, collection_backend_, albumcover_loader, make_shared<CurrentAlbumCoverLoader>(albumcover_loader), make_shared<CoverProviders>(), lyrics_providers_, make_shared<StreamingServices>());
+  ASSERT_TRUE(editor.SetSongs(SongList() << song));
+  ASSERT_TRUE(WaitFor([&editor]() { return editor.songs().count() == 1; }));
+
+  AlbumCoverChoiceController *album_cover_choice_controller = editor.findChild<AlbumCoverChoiceController*>();
+  ASSERT_NE(nullptr, album_cover_choice_controller);
+  QAction *delete_cover_action = album_cover_choice_controller->delete_cover_action();
+  ASSERT_TRUE(delete_cover_action->isEnabled());
+  {
+    // There's no file to ask about.
+    DeleteConfirmationAnswer answer(QDialogButtonBox::Yes);
+    delete_cover_action->trigger();
+    EXPECT_EQ(0, answer.shown());
+  }
+
+  QImage image(8, 8, QImage::Format_RGB32);
+  image.fill(Qt::red);
+  for (const QString &cover_filename : cover_filenames) {
+    ASSERT_TRUE(image.save(cover_filename, "JPG"));
+  }
+
+  QSignalSpy spy_accepted(&editor, &QDialog::accepted);
+  editor.accept();
+  ASSERT_TRUE(WaitFor([&spy_accepted]() { return spy_accepted.count() > 0; }));
+  for (const QString &cover_filename : cover_filenames) {
+    EXPECT_TRUE(QFile::exists(cover_filename)) << cover_filename.toStdString();
+  }
+
+  QThreadPool::globalInstance()->waitForDone();
+
+}
+
+// Regression test: the songs could be replaced while the user was asked, and then the cover of the songs in the same rows was deleted.
+TEST_F(SongEditorTest, TagEditorDoesNotDeleteCoverWhenSongsReplacedWhileAsking) {
+
+  QTemporaryDir temp_dir;
+  ASSERT_TRUE(temp_dir.isValid());
+  SongList songs;
+  QStringList cover_filenames;
+  for (const QString &name : {u"a"_s, u"b"_s}) {
+    Song song = CreateSong(temp_dir, name + u".mp3"_s);
+    ASSERT_TRUE(song.IsEditable());
+    song.set_source(Song::Source::Collection);
+    const QString cover_filename = temp_dir.filePath(name + u".jpg"_s);
+    QImage image(8, 8, QImage::Format_RGB32);
+    image.fill(Qt::red);
+    ASSERT_TRUE(image.save(cover_filename, "JPG"));
+    song.set_art_manual(QUrl::fromLocalFile(cover_filename));
+    songs << song;
+    cover_filenames << cover_filename;
+  }
+
+  SharedPtr<AlbumCoverLoader> albumcover_loader = make_shared<AlbumCoverLoader>(tagreader_client_);
+  TagEditor editor(make_shared<NetworkAccessManager>(), tagreader_client_, collection_backend_, albumcover_loader, make_shared<CurrentAlbumCoverLoader>(albumcover_loader), make_shared<CoverProviders>(), lyrics_providers_, make_shared<StreamingServices>());
+  ASSERT_TRUE(editor.SetSongs(SongList() << songs.value(0)));
+  ASSERT_TRUE(WaitFor([&editor]() { return editor.songs().count() == 1; }));
+
+  AlbumCoverChoiceController *album_cover_choice_controller = editor.findChild<AlbumCoverChoiceController*>();
+  ASSERT_NE(nullptr, album_cover_choice_controller);
+  QAction *delete_cover_action = album_cover_choice_controller->delete_cover_action();
+  ASSERT_TRUE(delete_cover_action->isEnabled());
+  {
+    // The other song is set while the user is asked about the cover of the first song.
+    DeleteConfirmationAnswer answer(QDialogButtonBox::Yes, [&editor, &songs]() { editor.SetSongs(SongList() << songs.value(1)); });
+    delete_cover_action->trigger();
+    EXPECT_EQ(1, answer.shown());
+    EXPECT_EQ(QStringList() << cover_filenames.value(0), answer.files());
+  }
+  ASSERT_TRUE(WaitFor([&editor, &songs]() { return editor.songs().count() == 1 && editor.songs().first().url() == songs.value(1).url(); }));
+
+  QSignalSpy spy_accepted(&editor, &QDialog::accepted);
+  editor.accept();
+  ASSERT_TRUE(WaitFor([&spy_accepted]() { return spy_accepted.count() > 0; }));
+  for (const QString &cover_filename : std::as_const(cover_filenames)) {
+    EXPECT_TRUE(QFile::exists(cover_filename)) << cover_filename.toStdString();
+  }
+
+  QThreadPool::globalInstance()->waitForDone();
+
+}
+
+// The cover is deleted for the songs the user was asked about, also when the selected songs changed while the user was asked.
+TEST_F(SongEditorTest, TagEditorDeletesCoverOfAskedSongs) {
+
+  QTemporaryDir temp_dir;
+  ASSERT_TRUE(temp_dir.isValid());
+  SongList songs;
+  QStringList cover_filenames;
+  for (const QString &name : {u"a"_s, u"b"_s}) {
+    Song song = CreateSong(temp_dir, name + u".mp3"_s);
+    ASSERT_TRUE(song.IsEditable());
+    song.set_source(Song::Source::Collection);
+    const QString cover_filename = temp_dir.filePath(name + u".jpg"_s);
+    QImage image(8, 8, QImage::Format_RGB32);
+    image.fill(Qt::red);
+    ASSERT_TRUE(image.save(cover_filename, "JPG"));
+    song.set_art_manual(QUrl::fromLocalFile(cover_filename));
+    songs << song;
+    cover_filenames << cover_filename;
+  }
+
+  SharedPtr<AlbumCoverLoader> albumcover_loader = make_shared<AlbumCoverLoader>(tagreader_client_);
+  TagEditor editor(make_shared<NetworkAccessManager>(), tagreader_client_, collection_backend_, albumcover_loader, make_shared<CurrentAlbumCoverLoader>(albumcover_loader), make_shared<CoverProviders>(), lyrics_providers_, make_shared<StreamingServices>());
+  ASSERT_TRUE(editor.SetSongs(songs));
+  ASSERT_TRUE(WaitFor([&editor]() { return editor.songs().count() == 2; }));
+
+  // The track selection dialog of the tag fetcher has a song list with the same name.
+  QListWidget *song_list = nullptr;
+  const QList<QListWidget*> song_lists = editor.findChildren<QListWidget*>(u"song_list"_s);
+  for (QListWidget *list : song_lists) {
+    if (list->window() == &editor) song_list = list;
+  }
+  ASSERT_NE(nullptr, song_list);
+
+  // Songs from different albums, so the cover is only deleted for the selected song.
+  song_list->clearSelection();
+  song_list->item(1)->setSelected(true);
+  LineEdit *album = editor.findChild<LineEdit*>(u"album"_s);
+  ASSERT_NE(nullptr, album);
+  album->setText(u"Other album"_s);
+  ASSERT_NE(editor.songs().value(0).album(), editor.songs().value(1).album());
+
+  song_list->clearSelection();
+  song_list->item(0)->setSelected(true);
+
+  AlbumCoverChoiceController *album_cover_choice_controller = editor.findChild<AlbumCoverChoiceController*>();
+  ASSERT_NE(nullptr, album_cover_choice_controller);
+  QAction *delete_cover_action = album_cover_choice_controller->delete_cover_action();
+  ASSERT_TRUE(delete_cover_action->isEnabled());
+  {
+    DeleteConfirmationAnswer answer(QDialogButtonBox::Yes, [song_list]() {
+      song_list->clearSelection();
+      song_list->item(1)->setSelected(true);
+    });
+    delete_cover_action->trigger();
+    EXPECT_EQ(1, answer.shown());
+    EXPECT_EQ(QStringList() << cover_filenames.value(0), answer.files());
+  }
+
+  QSignalSpy spy_accepted(&editor, &QDialog::accepted);
+  editor.accept();
+  ASSERT_TRUE(WaitFor([&spy_accepted]() { return spy_accepted.count() > 0; }));
+  EXPECT_FALSE(QFile::exists(cover_filenames.value(0)));
+  EXPECT_TRUE(QFile::exists(cover_filenames.value(1)));
+
+  QThreadPool::globalInstance()->waitForDone();
 
 }
 

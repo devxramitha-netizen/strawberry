@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cmath>
+#include <optional>
 
 #include <algorithm>
 #include <utility>
@@ -3649,7 +3650,13 @@ void MainWindow::ClearCover() {
 }
 
 void MainWindow::DeleteCover() {
-  album_cover_choice_controller_->DeleteCover(&song_, true);
+
+  // The current song can change while the user is asked, so the cover of the song the user was asked about is deleted.
+  Song song = song_;
+  const std::optional<QStringList> confirmed_files = album_cover_choice_controller_->ConfirmDeleteCover(SongList() << song);
+  if (!confirmed_files) return;
+  album_cover_choice_controller_->DeleteCover(&song, true, *confirmed_files);
+
 }
 
 void MainWindow::ShowCover() {

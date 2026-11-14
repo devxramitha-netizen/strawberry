@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <utility>
 #include <chrono>
+#include <optional>
 #include <memory>
 
 #include <QObject>
@@ -981,10 +982,26 @@ void AlbumCoverManager::ClearCover() {
 
 void AlbumCoverManager::DeleteCover() {
 
-  for (QListWidgetItem *list_widget_item : std::as_const(context_menu_items_)) {
-    AlbumItem *album_item = static_cast<AlbumItem*>(list_widget_item);
+  const QList<QListWidgetItem*> list_widget_items = context_menu_items_;
+  SongList songs;
+  for (QListWidgetItem *list_widget_item : list_widget_items) {
+    songs << AlbumItemAsSong(static_cast<AlbumItem*>(list_widget_item));
+  }
+  // Ask once for all the albums, the cover files can be the user's own images.
+  const std::optional<QStringList> confirmed_files = album_cover_choice_controller_->ConfirmDeleteCover(songs);
+  if (!confirmed_files) return;
+  // The albums are cleared when another artist is selected.
+  if (context_menu_items_ != list_widget_items) return;
+
+  for (qsizetype i = 0; i < list_widget_items.count(); ++i) {
+    AlbumItem *album_item = static_cast<AlbumItem*>(list_widget_items.value(i));
     Song song = AlbumItemAsSong(album_item);
-    album_cover_choice_controller_->DeleteCover(&song);
+    // The cover can change while the user is asked, like when a fetched cover is saved, then the new cover is kept.
+    const Song &asked_song = songs.at(i);
+    if (song.art_embedded() != asked_song.art_embedded() || song.art_automatic() != asked_song.art_automatic() || song.art_manual() != asked_song.art_manual() || song.art_unset() != asked_song.art_unset()) {
+      continue;
+    }
+    album_cover_choice_controller_->DeleteCover(&song, false, *confirmed_files);
     // The thumbnail of the removed cover could still be loading.
     CancelAlbumCoverLoading(album_item);
     album_item->setData(Role_CoverLoaded, true);

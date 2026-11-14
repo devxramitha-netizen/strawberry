@@ -22,12 +22,20 @@
 #include "config.h"
 
 #include <memory>
+#include <optional>
 
 #include "gtest_include.h"
 
 #include <QCoreApplication>
 #include <QThread>
 #include <QTemporaryDir>
+#include <QDir>
+#include <QFileInfo>
+#include <QStandardPaths>
+#include <QStringList>
+#include <QByteArray>
+#include <QUrl>
+#include <QDialogButtonBox>
 #include <QFile>
 #include <QString>
 #include <QImage>
@@ -54,6 +62,8 @@
 #include "covermanager/albumcoverimageresult.h"
 #include "streaming/streamingservices.h"
 #include "utilities/imageutils.h"
+
+#include "deleteconfirmationanswer.h"
 
 using namespace Qt::Literals::StringLiterals;
 using std::make_shared;
@@ -438,6 +448,182 @@ TEST_F(AlbumCoverChoiceControllerTest, DeletingAlbumCoverUnsetsCurrentAlbumSong)
   EXPECT_FALSE(current_albumcover_loader->last_song().art_embedded());
 
   database_->Close();
+
+}
+
+// Creates the directory of the file and saves an image to the file, returns false when it couldn't be saved.
+bool SaveImageFile(const QString &filename) {
+
+  if (!QDir().mkpath(QFileInfo(filename).path())) return false;
+  QImage image(8, 8, QImage::Format_RGB32);
+  image.fill(Qt::red);
+  return image.save(filename, "JPG");
+
+}
+
+// Regression test: deleting the cover deleted the user's own image used as cover, like an image in the album directory or another directory, without asking.
+// Only the cover files outside the album cover cache directory are listed for asking, the files in the cache are Strawberry's own copies.
+TEST_F(AlbumCoverChoiceControllerTest, CoverFilesOutsideCacheSkipsCacheFiles) {
+
+  // The cache is only redirected for the tests on Linux and BSD, keep the files out of the users own cache on Windows and macOS.
+  QStandardPaths::setTestModeEnabled(true);
+
+  QTemporaryDir temp_dir;
+  ASSERT_TRUE(temp_dir.isValid());
+  const QString cache_dir = Song::ImageCacheDir(Song::Source::Collection);
+  const QString album_cover = temp_dir.filePath(u"album/cover.jpg"_s);
+  const QString cache_cover = cache_dir + u"/cache-cover-test.jpg"_s;
+  // A directory starting with the name of the cache directory, and a path through the cache directory to a file outside of it.
+  const QString similar_dir_cover = cache_dir + u"-other/cover-test.jpg"_s;
+  const QString parent_dir_cover = QFileInfo(cache_dir).path() + u"/parent-cover-test.jpg"_s;
+  const QString parent_dir_cover_through_cache = cache_dir + u"/../parent-cover-test.jpg"_s;
+  for (const QString &filename : {album_cover, cache_cover, similar_dir_cover, parent_dir_cover}) {
+    ASSERT_TRUE(SaveImageFile(filename)) << filename.toStdString();
+  }
+
+  Song song1(Song::Source::Collection);
+  song1.set_art_automatic(QUrl::fromLocalFile(album_cover));
+  song1.set_art_manual(QUrl::fromLocalFile(cache_cover));
+  // The same cover as the first song is only listed once.
+  Song song2(Song::Source::Collection);
+  song2.set_art_manual(QUrl::fromLocalFile(album_cover));
+  // A cover file which doesn't exist is not deleted.
+  Song song3(Song::Source::Collection);
+  song3.set_art_manual(QUrl::fromLocalFile(temp_dir.filePath(u"missing.jpg"_s)));
+  Song song4(Song::Source::Collection);
+  song4.set_art_automatic(QUrl::fromLocalFile(similar_dir_cover));
+  song4.set_art_manual(QUrl::fromLocalFile(parent_dir_cover_through_cache));
+
+  // A song from a source without a cache directory.
+  Song song5(Song::Source::Device);
+  ASSERT_FALSE(QFileInfo::exists(Song::ImageCacheDir(Song::Source::Device)));
+  const QString device_cover = temp_dir.filePath(u"device/cover.jpg"_s);
+  ASSERT_TRUE(SaveImageFile(device_cover));
+  song5.set_art_manual(QUrl::fromLocalFile(device_cover));
+
+  EXPECT_EQ(QStringList() << album_cover << similar_dir_cover << parent_dir_cover_through_cache << device_cover, AlbumCoverChoiceController::CoverFilesOutsideCache(SongList() << song1 << song2 << song3 << song4 << song5));
+
+#ifndef Q_OS_WIN
+  // A cache file through a symbolic link to the cache directory is in the cache.
+  const QString cache_link = temp_dir.filePath(u"cache-link"_s);
+  ASSERT_TRUE(QFile::link(cache_dir, cache_link));
+  Song song6(Song::Source::Collection);
+  song6.set_art_manual(QUrl::fromLocalFile(cache_link + u"/cache-cover-test.jpg"_s));
+  EXPECT_TRUE(AlbumCoverChoiceController::CoverFilesOutsideCache(SongList() << song6).isEmpty());
+
+  // Deleting a symbolic link deletes the link, so a link outside the cache to a cache file is outside the cache, and a link in the cache to a file outside of it is in the cache.
+  const QString link_to_cache_cover = temp_dir.filePath(u"album/link-to-cache.jpg"_s);
+  ASSERT_TRUE(QFile::link(cache_cover, link_to_cache_cover));
+  const QString cache_link_to_album_cover = cache_dir + u"/link-to-album-cover-test.jpg"_s;
+  ASSERT_TRUE(QFile::link(album_cover, cache_link_to_album_cover));
+  Song song7(Song::Source::Collection);
+  song7.set_art_automatic(QUrl::fromLocalFile(link_to_cache_cover));
+  song7.set_art_manual(QUrl::fromLocalFile(cache_link_to_album_cover));
+  EXPECT_EQ(QStringList() << link_to_cache_cover, AlbumCoverChoiceController::CoverFilesOutsideCache(SongList() << song7));
+  QFile::remove(cache_link_to_album_cover);
+#endif
+
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+  // A cache file is in the cache when the path of the cache directory has a symbolic link, like a data directory which is a symbolic link.
+  const QByteArray data_home = qgetenv("XDG_DATA_HOME");
+  const QString data_home_link = temp_dir.filePath(u"data-home-link"_s);
+  ASSERT_TRUE(QFile::link(QString::fromLocal8Bit(data_home), data_home_link));
+  qputenv("XDG_DATA_HOME", data_home_link.toLocal8Bit());
+  const bool cache_cover_outside_cache = AlbumCoverChoiceController::CoverFilesOutsideCache(SongList() << song1).contains(cache_cover);
+  qputenv("XDG_DATA_HOME", data_home);
+  EXPECT_FALSE(cache_cover_outside_cache);
+#endif
+  EXPECT_TRUE(AlbumCoverChoiceController::CoverFilesOutsideCache(SongList() << song3).isEmpty());
+
+  for (const QString &filename : {cache_cover, similar_dir_cover, parent_dir_cover}) {
+    QFile::remove(filename);
+  }
+  QDir().rmdir(QFileInfo(similar_dir_cover).path());
+
+  QStandardPaths::setTestModeEnabled(false);
+
+}
+
+// Deleting a cover file outside the album cover cache directory asks first, a cover file in the cache is deleted without asking.
+TEST_F(AlbumCoverChoiceControllerTest, ConfirmDeleteCoverAsksForFilesOutsideCache) {
+
+  QStandardPaths::setTestModeEnabled(true);
+
+  QTemporaryDir temp_dir;
+  ASSERT_TRUE(temp_dir.isValid());
+  const QString album_cover = temp_dir.filePath(u"cover.jpg"_s);
+  const QString cache_cover = Song::ImageCacheDir(Song::Source::Collection) + u"/cache-cover-test.jpg"_s;
+  ASSERT_TRUE(SaveImageFile(album_cover));
+  ASSERT_TRUE(SaveImageFile(cache_cover));
+
+  Song album_song(Song::Source::Collection);
+  album_song.set_url(QUrl::fromLocalFile(temp_dir.filePath(u"song.flac"_s)));
+  album_song.set_albumartist(u"Artist"_s);
+  album_song.set_album(u"Album"_s);
+  album_song.set_art_automatic(QUrl::fromLocalFile(album_cover));
+  Song cache_song = album_song;
+  cache_song.clear_art_automatic();
+  cache_song.set_art_manual(QUrl::fromLocalFile(cache_cover));
+
+  AlbumCoverChoiceController controller;
+
+  {
+    DeleteConfirmationAnswer answer(QDialogButtonBox::Cancel);
+    EXPECT_FALSE(controller.ConfirmDeleteCover(SongList() << album_song << cache_song).has_value());
+    EXPECT_EQ(1, answer.shown());
+    EXPECT_EQ(QStringList() << album_cover, answer.files());
+  }
+  EXPECT_TRUE(QFile::exists(album_cover));
+
+  {
+    DeleteConfirmationAnswer answer(QDialogButtonBox::Yes);
+    EXPECT_EQ(std::optional<QStringList>(QStringList() << album_cover), controller.ConfirmDeleteCover(SongList() << album_song));
+    EXPECT_EQ(1, answer.shown());
+  }
+
+  {
+    DeleteConfirmationAnswer answer(QDialogButtonBox::Cancel);
+    EXPECT_EQ(std::optional<QStringList>(QStringList()), controller.ConfirmDeleteCover(SongList() << cache_song));
+    EXPECT_EQ(0, answer.shown());
+  }
+
+  QFile::remove(cache_cover);
+
+  QStandardPaths::setTestModeEnabled(false);
+
+}
+
+// Regression test: the cover could change while the user was asked, and then the new cover file was deleted, which the user wasn't asked about.
+// Only the cover files outside the cache which the user confirmed deleting are deleted, the cover files in the cache are deleted without asking.
+TEST_F(AlbumCoverChoiceControllerTest, DeleteCoverOnlyDeletesConfirmedFilesOutsideCache) {
+
+  QStandardPaths::setTestModeEnabled(true);
+
+  QTemporaryDir temp_dir;
+  ASSERT_TRUE(temp_dir.isValid());
+  const QString album_cover = temp_dir.filePath(u"cover.jpg"_s);
+  const QString cache_cover = Song::ImageCacheDir(Song::Source::Collection) + u"/cache-cover-test.jpg"_s;
+
+  AlbumCoverChoiceController controller;
+  controller.Init(make_shared<NetworkAccessManager>(), tagreader_client_, collection_backend_, albumcover_loader_, make_shared<CurrentAlbumCoverLoader>(albumcover_loader_), make_shared<CoverProviders>(), make_shared<StreamingServices>());
+
+  for (const bool confirmed : {false, true}) {
+    ASSERT_TRUE(SaveImageFile(album_cover));
+    ASSERT_TRUE(SaveImageFile(cache_cover));
+    Song song(Song::Source::Collection);
+    song.set_url(QUrl::fromLocalFile(temp_dir.filePath(u"song.flac"_s)));
+    song.set_albumartist(u"Artist"_s);
+    song.set_album(u"Album"_s);
+    song.set_art_automatic(QUrl::fromLocalFile(album_cover));
+    song.set_art_manual(QUrl::fromLocalFile(cache_cover));
+    EXPECT_TRUE(controller.DeleteCover(&song, false, confirmed ? QStringList() << album_cover : QStringList()));
+    EXPECT_EQ(!confirmed, QFile::exists(album_cover));
+    EXPECT_FALSE(QFile::exists(cache_cover));
+  }
+
+  database_->Close();
+
+  QStandardPaths::setTestModeEnabled(false);
 
 }
 

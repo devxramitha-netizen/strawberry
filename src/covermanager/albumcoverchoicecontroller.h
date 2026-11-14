@@ -24,6 +24,8 @@
 
 #include "config.h"
 
+#include <optional>
+
 #include <QtGlobal>
 #include <QObject>
 #include <QWidget>
@@ -34,6 +36,7 @@
 #include <QHash>
 #include <QByteArray>
 #include <QString>
+#include <QStringList>
 #include <QUrl>
 #include <QImage>
 #include <QMutex>
@@ -132,7 +135,18 @@ class AlbumCoverChoiceController : public QWidget {
   void ClearCover(Song *song);
 
   // Physically deletes associated album covers from disk.
-  bool DeleteCover(Song *song, const bool unset = false);
+  // The cover files outside the album cover cache directory are only deleted when they are in the confirmed files from ConfirmDeleteCover().
+  bool DeleteCover(Song *song, const bool unset = false, const QStringList &confirmed_files = QStringList());
+
+  // Returns the cover files which DeleteCover() deletes for the songs outside the album cover cache directory, like the album directory, since these can be the user's own images.
+  static QStringList CoverFilesOutsideCache(const SongList &songs);
+
+  // Asks the user to confirm deleting the cover files of the songs outside the album cover cache directory.
+  // Returns the files the user confirmed deleting, which can be none, or nothing when the user canceled.
+  std::optional<QStringList> ConfirmDeleteCover(const SongList &songs);
+
+  // Returns true when the cover file is in the album cover cache directory, or the user confirmed deleting it.
+  static bool CanDeleteCoverFile(const Song::Source source, const QString &filename, const QStringList &confirmed_files);
 
   // Shows the cover of given song in it's original size.
   void ShowCover(const Song &song, const QImage &image = QImage());
@@ -181,6 +195,8 @@ class AlbumCoverChoiceController : public QWidget {
   void LoadCurrentAlbumCover(const Song &song);
 
   static bool IsKnownImageExtension(const QString &suffix);
+  static bool IsInCoverCache(const Song::Source source, const QString &filename);
+  bool DeleteCoverFile(const Song::Source source, const QUrl &url, const QStringList &confirmed_files);
 
   SharedPtr<CurrentAlbumCoverLoader> current_albumcover_loader_;
   SharedPtr<NetworkAccessManager> network_;

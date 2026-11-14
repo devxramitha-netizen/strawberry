@@ -108,7 +108,10 @@ class TagEditor : public SongEditor {
 
  private:
   Song *GetFirstSelected();
+  // Returns the rows of the selected songs, and the songs of the album when the selected songs are from one album, since the cover is for the album.
+  QList<int> CoverUpdateRows() const;
   void UpdateCover(const UpdateCoverAction cover_action, const AlbumCoverImageResult &cover_result = AlbumCoverImageResult());
+  void UpdateCover(const QList<int> &rows, const UpdateCoverAction cover_action, const AlbumCoverImageResult &cover_result = AlbumCoverImageResult());
 
   void UpdateSummaryTab(const Song &song);
   void UpdateStatisticsTab(const Song &song);
