@@ -1,3 +1,24 @@
+# Optimized by ci-cost (https://github.com/mariotavarez/ci-cost)
+# Applied 17 optimizations:
+# - [MEDIUM] Add concurrency group to "build.yaml"
+# - [MEDIUM] 15 jobs clone the repo — consider artifact sharing
+# - [LOW] Use shallow clone in "build-opensuse" job
+# - [LOW] Use shallow clone in "build-fedora" job
+# - [LOW] Use shallow clone in "build-openmandriva" job
+# - [LOW] Use shallow clone in "build-mageia" job
+# - [LOW] Use shallow clone in "build-debian" job
+# - [LOW] Use shallow clone in "build-ubuntu" job
+# - [LOW] Use shallow clone in "upload-ubuntu-ppa" job
+# - [LOW] Use shallow clone in "build-appimage" job
+# - [LOW] Use shallow clone in "build-freebsd" job
+# - [LOW] Use shallow clone in "build-openbsd" job
+# - [LOW] Use shallow clone in "build-macos" job
+# - [LOW] Use shallow clone in "build-windows-mingw" job
+# - [LOW] Use shallow clone in "build-windows-msvc" job
+# - [LOW] Use shallow clone in "upload" job
+# - [LOW] Use shallow clone in "attach" job
+# Estimated savings: ~3 min/run
+#
 name: Build
 on:
   workflow_dispatch:
@@ -7,6 +28,10 @@ on:
   release:
     types: [published]
 
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
 
   build-opensuse:
